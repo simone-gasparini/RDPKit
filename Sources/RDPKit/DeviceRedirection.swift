@@ -43,6 +43,11 @@ enum RDPDeviceRedirectionPacketID {
     }
 }
 
+/// RDPDR device types, used when announcing a redirected filesystem (see DriveRedirection.swift).
+enum RDPDeviceRedirectionDeviceType {
+    static let filesystem: UInt32 = 0x0000_0004
+}
+
 enum RDPDeviceRedirectionVersion {
     static let major: UInt16 = 0x0001
     static let minorRDP5: UInt16 = 0x0002
@@ -403,13 +408,40 @@ struct RDPDeviceRedirectionServerCapabilities: Equatable, Sendable {
 }
 
 struct RDPDeviceRedirectionDeviceListAnnounce: Equatable, Sendable {
+    /// A shared drive to announce, or nil for an empty device list.
+    var drive: (deviceID: UInt32, dosName: String)?
+
+    init(drive: (deviceID: UInt32, dosName: String)? = nil) {
+        self.drive = drive
+    }
+
+    static func == (lhs: RDPDeviceRedirectionDeviceListAnnounce, rhs: RDPDeviceRedirectionDeviceListAnnounce) -> Bool {
+        lhs.drive?.deviceID == rhs.drive?.deviceID && lhs.drive?.dosName == rhs.drive?.dosName
+    }
+
     func encoded() -> Data {
         var payload = Data()
-        payload.appendLittleEndianUInt32(0)
+        if let drive {
+            payload.appendLittleEndianUInt32(1)                                   // DeviceCount
+            payload.appendLittleEndianUInt32(RDPDeviceRedirectionDeviceType.filesystem)
+            payload.appendLittleEndianUInt32(drive.deviceID)
+            payload.append(Self.preferredDosName(drive.dosName))                  // 8 bytes
+            payload.appendLittleEndianUInt32(0)                                   // DeviceDataLength
+        } else {
+            payload.appendLittleEndianUInt32(0)
+        }
         return RDPDeviceRedirectionPDU(
             header: RDPDeviceRedirectionHeader(packetID: RDPDeviceRedirectionPacketID.deviceListAnnounce),
             payload: payload
         ).encoded()
+    }
+
+    /// PreferredDosName: 8 bytes, ASCII, null-padded (the name Windows shows for the drive).
+    private static func preferredDosName(_ name: String) -> Data {
+        let ascii = name.unicodeScalars.filter { $0.isASCII && $0.value >= 0x20 }.prefix(7).map { UInt8($0.value) }
+        var data = Data(ascii)
+        data.append(Data(count: 8 - data.count))
+        return data
     }
 }
 
@@ -421,17 +453,27 @@ final class RDPDeviceRedirectionSession: @unchecked Sendable {
     private let lock = NSLock()
     private var minorVersion = RDPDeviceRedirectionVersion.minorRDP6
     private var announcedClientID: UInt32?
+    /// Shared folder announced as a redirected drive (nil = announce no devices, as upstream does).
+    private let driveShare: RDPDriveShare?
+    private let driveDeviceID: UInt32 = 1
 
     init(
         userChannelID: UInt16,
         staticChannelID: UInt16,
         channel: Channel,
-        computerName: String
+        computerName: String,
+        driveShare: RDPDriveShare? = nil
     ) {
         self.userChannelID = userChannelID
         self.staticChannelID = staticChannelID
         self.channel = channel
         self.computerName = computerName
+        self.driveShare = driveShare
+    }
+
+    private func deviceListAnnounce() -> Data {
+        let drive = driveShare.map { (deviceID: driveDeviceID, dosName: $0.label) }
+        return RDPDeviceRedirectionDeviceListAnnounce(drive: drive).encoded()
     }
 
     func receive(_ pdu: RDPDeviceRedirectionPDU) throws {
@@ -470,7 +512,7 @@ final class RDPDeviceRedirectionSession: @unchecked Sendable {
                     throw RDPDecodeError.invalidStaticVirtualChannelPDU
                 }
                 if confirm.minor == RDPDeviceRedirectionVersion.minorRDP51 {
-                    send(RDPDeviceRedirectionDeviceListAnnounce().encoded())
+                    send(deviceListAnnounce())
                 }
             }
 
@@ -478,11 +520,46 @@ final class RDPDeviceRedirectionSession: @unchecked Sendable {
             guard pdu.payload.isEmpty else {
                 throw RDPDecodeError.invalidStaticVirtualChannelPDU
             }
-            send(RDPDeviceRedirectionDeviceListAnnounce().encoded())
+            // Upstream sends an empty announce here; the fork announces the shared drive.
+            send(deviceListAnnounce())
+
+        case RDPDeviceRedirectionPacketID.deviceIORequest:
+            handleIORequest(pdu)
 
         default:
             return
         }
+    }
+
+    /// Dispatch a Device I/O Request to the shared drive and reply with a Device I/O Completion.
+    private func handleIORequest(_ pdu: RDPDeviceRedirectionPDU) {
+        guard let driveShare else { return }
+        var cursor = ByteCursor(pdu.payload)
+        guard let request = try? RDPDriveIORequest.parse(from: &cursor),
+              request.deviceID == driveDeviceID else { return }
+        let (status, body) = driveShare.handle(request, body: &cursor)
+        send(deviceIOCompletionEncoded(
+            deviceID: request.deviceID, completionID: request.completionID, status: status, body: body
+        ))
+    }
+
+    /// Tear down open file handles (call on channel close).
+    func reset() {
+        driveShare?.reset()
+    }
+
+    private func deviceIOCompletionEncoded(
+        deviceID: UInt32, completionID: UInt32, status: UInt32, body: Data
+    ) -> Data {
+        var payload = Data()
+        payload.appendLittleEndianUInt32(deviceID)
+        payload.appendLittleEndianUInt32(completionID)
+        payload.appendLittleEndianUInt32(status)
+        payload.append(body)
+        return RDPDeviceRedirectionPDU(
+            header: RDPDeviceRedirectionHeader(packetID: RDPDeviceRedirectionPacketID.deviceIOCompletion),
+            payload: payload
+        ).encoded()
     }
 
     private func currentMinorVersion() -> UInt16 {
