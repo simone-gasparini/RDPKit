@@ -3849,7 +3849,9 @@ private func performMCSConnectionSequence(
                                 staticChannelID: $0,
                                 channel: channel,
                                 computerName: configuration.clientName,
-                                driveShare: driveShare
+                                driveShare: driveShare,
+                                maximumChunkByteCount: demandActive.serverVirtualChannelChunkSize
+                                    ?? RDPStaticVirtualChannelPDU.maximumPayloadByteCount
                             )
                         }
                         var clipboardMessageData: [Data] = []
@@ -5421,15 +5423,18 @@ private func handleClipboardPacket(
 ) throws -> Bool {
     guard let staticPDU = try RDPStaticVirtualChannelPDU.parseIfPresent(
         fromTPKT: packet,
-        channelID: session.staticChannelID
+        channelID: session.staticChannelID,
+        maximumChunkByteCount: RDPStaticVirtualChannelPDU.maximumNegotiatedChunkByteCount,
+        requiresShowProtocol: false
     ) else {
         return false
     }
-    guard staticPDU.canDispatchPayload else {
-        if staticPDU.isFlowControl {
-            return true
-        }
-        throw RDPDecodeError.invalidStaticVirtualChannelPDU
+    // A message larger than one chunk arrives as fragments; hold them until the last one.
+    // Previously any fragmented message threw out of the receive loop and tore down the session.
+    guard let staticPDU = try session.inbound.accept(
+        staticPDU, maximumChunkByteCount: RDPStaticVirtualChannelPDU.maximumNegotiatedChunkByteCount
+    ) else {
+        return true
     }
 
     let clipboardPDU = try RDPClipboardPDU.parse(from: staticPDU.payload)
@@ -5524,15 +5529,18 @@ private func handleAudioPacket(
 ) throws -> Bool {
     guard let staticPDU = try RDPStaticVirtualChannelPDU.parseIfPresent(
         fromTPKT: packet,
-        channelID: session.staticChannelID
+        channelID: session.staticChannelID,
+        maximumChunkByteCount: RDPStaticVirtualChannelPDU.maximumNegotiatedChunkByteCount,
+        requiresShowProtocol: false
     ) else {
         return false
     }
-    guard staticPDU.canDispatchPayload else {
-        if staticPDU.isFlowControl {
-            return true
-        }
-        throw RDPDecodeError.invalidStaticVirtualChannelPDU
+    // A message larger than one chunk arrives as fragments; hold them until the last one.
+    // Previously any fragmented message threw out of the receive loop and tore down the session.
+    guard let staticPDU = try session.inbound.accept(
+        staticPDU, maximumChunkByteCount: RDPStaticVirtualChannelPDU.maximumNegotiatedChunkByteCount
+    ) else {
+        return true
     }
 
     try handleAudioPayload(
@@ -5612,15 +5620,18 @@ private func handleDeviceRedirectionPacket(
 ) throws -> Bool {
     guard let staticPDU = try RDPStaticVirtualChannelPDU.parseIfPresent(
         fromTPKT: packet,
-        channelID: session.staticChannelID
+        channelID: session.staticChannelID,
+        maximumChunkByteCount: RDPStaticVirtualChannelPDU.maximumNegotiatedChunkByteCount,
+        requiresShowProtocol: false
     ) else {
         return false
     }
-    guard staticPDU.canDispatchPayload else {
-        if staticPDU.isFlowControl {
-            return true
-        }
-        throw RDPDecodeError.invalidStaticVirtualChannelPDU
+    // A message larger than one chunk arrives as fragments; hold them until the last one.
+    // Previously any fragmented message threw out of the receive loop and tore down the session.
+    guard let staticPDU = try session.inbound.accept(
+        staticPDU, maximumChunkByteCount: RDPStaticVirtualChannelPDU.maximumNegotiatedChunkByteCount
+    ) else {
+        return true
     }
 
     let deviceRedirectionPDU = try RDPDeviceRedirectionPDU.parse(from: staticPDU.payload)

@@ -1,5 +1,8 @@
 import Foundation
+import os
 @preconcurrency import NIOCore
+
+private let rdpdrLog = Logger(subsystem: "RDPKit", category: "rdpdr")
 
 enum RDPDeviceRedirectionComponent {
     static let core: UInt16 = 0x4472
@@ -43,9 +46,18 @@ enum RDPDeviceRedirectionPacketID {
     }
 }
 
-/// RDPDR device types, used when announcing a redirected filesystem (see DriveRedirection.swift).
+/// RDPDR device types (MS-RDPEFS 2.2.1.3 DEVICE_ANNOUNCE, DeviceType).
+///
+/// Spelled out because the value matters more than the name: announcing a shared folder as
+/// `print` (0x04) is accepted by the server with STATUS_SUCCESS and registered as a redirected
+/// printer, so `\\tsclient` is never created and no filesystem IRP ever arrives - a failure that
+/// looks exactly like "the share is not configured".
 enum RDPDeviceRedirectionDeviceType {
-    static let filesystem: UInt32 = 0x0000_0004
+    static let serial: UInt32 = 0x0000_0001
+    static let parallel: UInt32 = 0x0000_0002
+    static let print: UInt32 = 0x0000_0004
+    static let filesystem: UInt32 = 0x0000_0008
+    static let smartCard: UInt32 = 0x0000_0020
 }
 
 enum RDPDeviceRedirectionVersion {
@@ -248,13 +260,27 @@ struct RDPDeviceRedirectionClientCapabilities: Equatable, Sendable {
 
     func encoded() -> Data {
         var payload = Data()
-        payload.appendLittleEndianUInt16(1)
-        payload.appendLittleEndianUInt16(0)
+        payload.appendLittleEndianUInt16(2)   // numCapabilities: GENERAL + DRIVE
+        payload.appendLittleEndianUInt16(0)   // padding
         payload.append(generalCapabilityEncoded())
+        payload.append(driveCapabilityEncoded())
         return RDPDeviceRedirectionPDU(
             header: RDPDeviceRedirectionHeader(packetID: RDPDeviceRedirectionPacketID.clientCapability),
             payload: payload
         ).encoded()
+    }
+
+    /// CAP_DRIVE_TYPE (MS-RDPEFS 2.2.2.4). Header-only: type, length 8, version.
+    ///
+    /// A server will not accept a redirected filesystem from a client that never advertised drive
+    /// support - the `\\tsclient` node appears in Explorer but stays empty, which is indistinguishable
+    /// from "the share is not configured". Announcing the device is not enough on its own.
+    private func driveCapabilityEncoded() -> Data {
+        var data = Data()
+        data.appendLittleEndianUInt16(RDPDeviceRedirectionCapability.driveType)
+        data.appendLittleEndianUInt16(RDPDeviceRedirectionCapability.headerLength)
+        data.appendLittleEndianUInt32(RDPDeviceRedirectionCapability.driveVersion2)
+        return data
     }
 
     private func generalCapabilityEncoded() -> Data {
@@ -422,11 +448,18 @@ struct RDPDeviceRedirectionDeviceListAnnounce: Equatable, Sendable {
     func encoded() -> Data {
         var payload = Data()
         if let drive {
+            // DeviceData for a file system device is the volume label as a null-terminated ASCII
+            // string, and DeviceDataLength counts it including the terminator (MS-RDPEFS 2.2.1.3).
+            // Sending a zero-length DeviceData is NOT rejected - the server replies success - but
+            // the drive then never appears under \\tsclient, which is indistinguishable from an
+            // unconfigured share.
+            let deviceData = Self.volumeLabel(drive.dosName)
             payload.appendLittleEndianUInt32(1)                                   // DeviceCount
             payload.appendLittleEndianUInt32(RDPDeviceRedirectionDeviceType.filesystem)
             payload.appendLittleEndianUInt32(drive.deviceID)
             payload.append(Self.preferredDosName(drive.dosName))                  // 8 bytes
-            payload.appendLittleEndianUInt32(0)                                   // DeviceDataLength
+            payload.appendLittleEndianUInt32(UInt32(deviceData.count))            // DeviceDataLength
+            payload.append(deviceData)                                            // DeviceData
         } else {
             payload.appendLittleEndianUInt32(0)
         }
@@ -434,6 +467,18 @@ struct RDPDeviceRedirectionDeviceListAnnounce: Equatable, Sendable {
             header: RDPDeviceRedirectionHeader(packetID: RDPDeviceRedirectionPacketID.deviceListAnnounce),
             payload: payload
         ).encoded()
+    }
+
+    /// DeviceData for a file system device: the drive name, null-terminated **ASCII**.
+    ///
+    /// MS-RDPEFS 2.2.3.1 can be read as requiring Unicode once DRIVE_CAPABILITY_VERSION_02 is
+    /// advertised, but Windows 11 demonstrably parses this as ASCII: a UTF-16LE four-letter label
+    /// surfaced the drive as `\\tsclient\\<first letter>`, truncated at the first NUL byte.
+    private static func volumeLabel(_ name: String) -> Data {
+        let ascii = name.unicodeScalars.filter { $0.isASCII && $0.value >= 0x20 }.map { UInt8($0.value) }
+        var data = Data(ascii.isEmpty ? Array("Shared".utf8) : Array(ascii))
+        data.append(0)
+        return data
     }
 
     /// PreferredDosName: 8 bytes, ASCII, null-padded (the name Windows shows for the drive).
@@ -446,6 +491,9 @@ struct RDPDeviceRedirectionDeviceListAnnounce: Equatable, Sendable {
 }
 
 final class RDPDeviceRedirectionSession: @unchecked Sendable {
+    /// Inbound fragment reassembly for this channel (MS-RDPBCGR 3.1.5.2.1).
+    let inbound = RDPStaticVirtualChannelInbound()
+
     let staticChannelID: UInt16
     private let userChannelID: UInt16
     private let channel: Channel
@@ -456,24 +504,38 @@ final class RDPDeviceRedirectionSession: @unchecked Sendable {
     /// Shared folder announced as a redirected drive (nil = announce no devices, as upstream does).
     private let driveShare: RDPDriveShare?
     private let driveDeviceID: UInt32 = 1
+    /// Largest payload one static-virtual-channel PDU may carry, as negotiated in Demand Active.
+    private let maximumChunkByteCount: Int
 
     init(
         userChannelID: UInt16,
         staticChannelID: UInt16,
         channel: Channel,
         computerName: String,
-        driveShare: RDPDriveShare? = nil
+        driveShare: RDPDriveShare? = nil,
+        maximumChunkByteCount: Int = RDPStaticVirtualChannelPDU.maximumPayloadByteCount
     ) {
         self.userChannelID = userChannelID
         self.staticChannelID = staticChannelID
         self.channel = channel
         self.computerName = computerName
         self.driveShare = driveShare
+        self.maximumChunkByteCount = maximumChunkByteCount
     }
 
     private func deviceListAnnounce() -> Data {
-        let drive = driveShare.map { (deviceID: driveDeviceID, dosName: $0.label) }
-        return RDPDeviceRedirectionDeviceListAnnounce(drive: drive).encoded()
+        // Announce nothing rather than announce a folder that is no longer there - see
+        // RDPDriveShare.rootExists for why a broken share is worse than an absent one.
+        if let driveShare, driveShare.rootExists == false {
+            rdpdrLog.error(
+                "drive share \(driveShare.label, privacy: .public) not announced: shared folder is missing at \(driveShare.rootURL.path, privacy: .public)"
+            )
+        }
+        let drive = driveShare
+            .flatMap { $0.rootExists ? $0 : nil }
+            .map { (deviceID: driveDeviceID, dosName: $0.label) }
+        let data = RDPDeviceRedirectionDeviceListAnnounce(drive: drive).encoded()
+        return data
     }
 
     func receive(_ pdu: RDPDeviceRedirectionPDU) throws {
@@ -493,12 +555,15 @@ final class RDPDeviceRedirectionSession: @unchecked Sendable {
             minorVersion = min(RDPDeviceRedirectionVersion.minorRDP6, announce.minor)
             announcedClientID = clientID
             lock.unlock()
-            send(announce.clientAnnounceReplyEncoded(clientID: clientID))
-            send(RDPDeviceRedirectionClientNameRequest(computerName: computerName).encoded())
+            let announceReply = announce.clientAnnounceReplyEncoded(clientID: clientID)
+            let nameRequest = RDPDeviceRedirectionClientNameRequest(computerName: computerName).encoded()
+            send(announceReply)
+            send(nameRequest)
 
         case RDPDeviceRedirectionPacketID.serverCapability:
             _ = try RDPDeviceRedirectionServerCapabilities.parse(from: pdu)
-            send(RDPDeviceRedirectionClientCapabilities(minorVersion: currentMinorVersion()).encoded())
+            let reply = RDPDeviceRedirectionClientCapabilities(minorVersion: currentMinorVersion()).encoded()
+            send(reply)
 
         case RDPDeviceRedirectionPacketID.clientIDConfirm:
             if let confirm = try RDPDeviceRedirectionVersionAndID.parse(from: pdu) {
@@ -526,6 +591,11 @@ final class RDPDeviceRedirectionSession: @unchecked Sendable {
         case RDPDeviceRedirectionPacketID.deviceIORequest:
             handleIORequest(pdu)
 
+        case RDPDeviceRedirectionPacketID.deviceReply:
+            // The server's verdict on the device we announced. Nothing to do with it: a refusal
+            // simply means no I/O requests will arrive for that device.
+            break
+
         default:
             return
         }
@@ -537,10 +607,13 @@ final class RDPDeviceRedirectionSession: @unchecked Sendable {
         var cursor = ByteCursor(pdu.payload)
         guard let request = try? RDPDriveIORequest.parse(from: &cursor),
               request.deviceID == driveDeviceID else { return }
-        let (status, body) = driveShare.handle(request, body: &cursor)
-        send(deviceIOCompletionEncoded(
+        guard let (status, body) = driveShare.handle(request, body: &cursor) else {
+            return
+        }
+        let completion = deviceIOCompletionEncoded(
             deviceID: request.deviceID, completionID: request.completionID, status: status, body: body
-        ))
+        )
+        send(completion)
     }
 
     /// Tear down open file handles (call on channel close).
@@ -569,15 +642,22 @@ final class RDPDeviceRedirectionSession: @unchecked Sendable {
     }
 
     private func send(_ payload: Data) {
-        let packet = RDPStaticVirtualChannelPDU(payload: payload)
-            .encodedTPKT(initiator: userChannelID, channelID: staticChannelID)
+        // Fragment rather than trap: a file read or a long directory entry easily exceeds one
+        // chunk, and the single-PDU initialiser enforces its size limit with a precondition, which
+        // is live in release builds. Before this, the first large READ killed the process.
+        let packets = RDPStaticVirtualChannelPDU
+            .chunks(forPayload: payload, chunkByteCount: maximumChunkByteCount)
+            .map { $0.encodedTPKT(initiator: userChannelID, channelID: staticChannelID) }
         channel.eventLoop.execute {
             guard self.channel.isActive else {
                 return
             }
-            var buffer = self.channel.allocator.buffer(capacity: packet.count)
-            buffer.writeBytes(packet)
-            self.channel.writeAndFlush(buffer, promise: nil)
+            for packet in packets {
+                var buffer = self.channel.allocator.buffer(capacity: packet.count)
+                buffer.writeBytes(packet)
+                self.channel.write(buffer, promise: nil)
+            }
+            self.channel.flush()
         }
     }
 }

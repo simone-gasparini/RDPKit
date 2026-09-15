@@ -27,6 +27,7 @@ enum RDPDriveMinorFunction {
 enum RDPDriveStatus {
     static let success: UInt32 = 0x0000_0000
     static let noMoreFiles: UInt32 = 0x8000_0006
+    static let noSuchFile: UInt32 = 0xC000_000F
     static let unsuccessful: UInt32 = 0xC000_0001
     static let notImplemented: UInt32 = 0xC000_0002
     static let endOfFile: UInt32 = 0xC000_0011
@@ -37,6 +38,7 @@ enum RDPDriveStatus {
     static let notSupported: UInt32 = 0xC000_00BB
     static let directoryNotEmpty: UInt32 = 0xC000_0101
     static let notADirectory: UInt32 = 0xC000_0103
+    static let fileIsADirectory: UInt32 = 0xC000_00BA
 }
 
 enum RDPDriveFileAttribute {
@@ -117,12 +119,19 @@ final class RDPDriveShare {
     let label: String
     private let fileManager = FileManager.default
 
+    /// One name in a directory enumeration. The name is carried separately from the URL because the
+    /// `.` and `..` entries report a name that is not their target's last path component.
+    private struct DirectoryListingEntry {
+        var name: String
+        var url: URL
+    }
+
     private struct OpenFile {
         var url: URL
         var isDirectory: Bool
         var deleteOnClose: Bool
         var handle: FileHandle?
-        var enumeration: [URL]?     // directory listing, built on the initial query
+        var enumeration: [DirectoryListingEntry]?   // directory listing, built on the initial query
         var enumIndex: Int
     }
 
@@ -139,8 +148,22 @@ final class RDPDriveShare {
         self.label = label.isEmpty ? "Shared" : label
     }
 
-    /// Handle one request; returns the IoStatus + the per-function completion body (after IoStatus).
-    func handle(_ request: RDPDriveIORequest, body: inout ByteCursor) -> (status: UInt32, payload: Data) {
+    /// Whether the shared folder still exists and is a directory.
+    ///
+    /// A share whose folder has been deleted or renamed since it was configured is worse than no
+    /// share at all: the device is announced, the server accepts it, `\\tsclient\<label>` appears -
+    /// and then every single I/O request, including the open of the share root itself, is answered
+    /// STATUS_OBJECT_NAME_NOT_FOUND. The user sees a share that exists but cannot be opened, with
+    /// nothing to indicate which end is at fault.
+    var rootExists: Bool {
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: rootURL.path, isDirectory: &isDirectory) else { return false }
+        return isDirectory.boolValue
+    }
+
+    /// Handle one request; returns the IoStatus + the per-function completion body (after IoStatus),
+    /// or `nil` when the request must be left pending and not answered at all.
+    func handle(_ request: RDPDriveIORequest, body: inout ByteCursor) -> (status: UInt32, payload: Data)? {
         switch request.majorFunction {
         case RDPDriveMajorFunction.create: return create(&body)
         case RDPDriveMajorFunction.close: return close(request.fileID)
@@ -150,11 +173,24 @@ final class RDPDriveShare {
         case RDPDriveMajorFunction.setInformation: return setInformation(request.fileID, &body)
         case RDPDriveMajorFunction.queryVolumeInformation: return queryVolume(&body)
         case RDPDriveMajorFunction.directoryControl:
-            return request.minorFunction == RDPDriveMinorFunction.queryDirectory
-                ? queryDirectory(request.fileID, &body)
-                : (RDPDriveStatus.notSupported, Data())   // notify-change: no live refresh in v1
-        case RDPDriveMajorFunction.lockControl: return (RDPDriveStatus.success, Data())
-        default: return (RDPDriveStatus.notImplemented, Data())
+            switch request.minorFunction {
+            case RDPDriveMinorFunction.queryDirectory:
+                return queryDirectory(request.fileID, &body)
+            case RDPDriveMinorFunction.notifyChangeDirectory:
+                // A change-notification IRP is meant to stay outstanding until the directory
+                // actually changes; it is not a request that gets answered now. Completing it -
+                // with any status, success or error - tells Windows the directory handle is
+                // finished, and Explorer abandons the listing before it ever sends a single
+                // QUERY_DIRECTORY. Leaving it pending is what a working client does, and costs
+                // nothing: there is no live refresh to deliver, so the IRP simply never completes.
+                return nil
+            default:
+                return (RDPDriveStatus.notSupported, lengthPrefixed(Data()))
+            }
+        case RDPDriveMajorFunction.lockControl:
+            // DR_DRIVE_LOCK_CONTROL_RSP is DeviceIoReply followed by 5 bytes of padding.
+            return (RDPDriveStatus.success, Data(repeating: 0, count: 5))
+        default: return (RDPDriveStatus.notImplemented, lengthPrefixed(Data()))
         }
     }
 
@@ -194,7 +230,7 @@ final class RDPDriveShare {
 
     private func create(_ body: inout ByteCursor) -> (UInt32, Data) {
         guard
-            let desiredAccess = try? body.readLittleEndianUInt32(),
+            let _ = try? body.readLittleEndianUInt32(),          // DesiredAccess
             let _ = try? body.readLittleEndianUInt64(),          // AllocationSize
             let _ = try? body.readLittleEndianUInt32(),          // FileAttributes
             let _ = try? body.readLittleEndianUInt32(),          // SharedAccess
@@ -203,7 +239,6 @@ final class RDPDriveShare {
             let pathLength = try? body.readLittleEndianUInt32(),
             let pathData = try? body.readData(count: Int(pathLength))
         else { return failure() }
-        _ = desiredAccess
 
         let remotePath = decodeUTF16(pathData)
         guard let url = resolve(remotePath) else {
@@ -213,6 +248,21 @@ final class RDPDriveShare {
         let existed = fileManager.fileExists(atPath: url.path)
         var isDir = existsDirectory(url)
         let wantsDirectory = options & RDPDriveCreateOptions.directoryFile != 0
+        let wantsFile = options & RDPDriveCreateOptions.nonDirectoryFile != 0
+
+        // Honour the caller's assertion about what it is opening. Explorer decides whether an item
+        // is a folder by opening it with FILE_DIRECTORY_FILE and seeing whether that succeeds:
+        // answering STATUS_SUCCESS for a regular file makes it treat the file as a folder, which
+        // shows up as a document with "0 bytes, 0 files, 0 folders" in its properties and an
+        // IRP_MN_QUERY_DIRECTORY we can only fail. These are the NT semantics the probe relies on.
+        if existed {
+            if wantsDirectory, isDir == false {
+                return (RDPDriveStatus.notADirectory, createBody(fileID: 0, information: 0))
+            }
+            if wantsFile, isDir {
+                return (RDPDriveStatus.fileIsADirectory, createBody(fileID: 0, information: 0))
+            }
+        }
 
         switch disposition {
         case RDPDriveCreateDisposition.open:
@@ -269,6 +319,17 @@ final class RDPDriveShare {
 
     // MARK: - READ / WRITE
 
+    /// Largest single read this client will service, regardless of what the server asks for.
+    ///
+    /// `Length` in DR_DRIVE_READ_REQ is chosen entirely by the remote and may be up to 4 GiB. It is
+    /// the one field that sizes an allocation from a local file rather than from the bytes actually
+    /// received, so without a ceiling a hostile - or merely confused - server can make the client
+    /// allocate far more than it sent. Windows reads a redirected drive in 64 KiB requests, and
+    /// answering with fewer bytes than were asked for is legal: the reply carries its own Length and
+    /// the server simply issues another read. 8 MiB leaves two orders of magnitude of headroom over
+    /// anything observed while keeping a single request bounded.
+    private static let maximumReadByteCount = 8 * 1_024 * 1_024
+
     private func read(_ fileID: UInt32, _ body: inout ByteCursor) -> (UInt32, Data) {
         guard let length = try? body.readLittleEndianUInt32(),
               let offset = try? body.readLittleEndianUInt64(),
@@ -276,7 +337,7 @@ final class RDPDriveShare {
         else { return failure() }
         do {
             try handle.seek(toOffset: offset)
-            let data = handle.readData(ofLength: Int(length))
+            let data = handle.readData(ofLength: min(Int(length), Self.maximumReadByteCount))
             var payload = Data()
             payload.appendLittleEndianUInt32(UInt32(data.count))
             payload.append(data)
@@ -323,14 +384,19 @@ final class RDPDriveShare {
             buffer.appendLittleEndianUInt64(fileTime(modified))
             buffer.appendLittleEndianUInt64(fileTime(modified))
             buffer.appendLittleEndianUInt32(fileAttributes(file.url, isDirectory: file.isDirectory))
-            buffer.appendLittleEndianUInt32(0)
+            // No trailing Reserved: MS-RDPEFS 2.2.3.3.8 sends FILE_BASIC_INFORMATION without the
+            // NT struct's padding, so the buffer is 36 bytes. FreeRDP encodes the same 36.
         case RDPDriveFsInformationClass.fileStandardInformation:
-            buffer.appendLittleEndianUInt64(size)                   // AllocationSize
-            buffer.appendLittleEndianUInt64(size)                   // EndOfFile
+            // Report zero length for a directory: macOS gives a directory inode a real byte size
+            // (e.g. 1088), and NTFS reports zero. Matching NTFS is the conservative choice, though
+            // it is not known to be required - FreeRDP passes st_size through here and works.
+            let reportedSize = file.isDirectory ? 0 : size
+            buffer.appendLittleEndianUInt64(reportedSize)           // AllocationSize
+            buffer.appendLittleEndianUInt64(reportedSize)           // EndOfFile
             buffer.appendLittleEndianUInt32(1)                      // NumberOfLinks
             buffer.appendUInt8(0)                                   // DeletePending
             buffer.appendUInt8(file.isDirectory ? 1 : 0)           // Directory
-            buffer.appendLittleEndianUInt16(0)                     // Reserved
+            // No trailing Reserved: 2.2.3.3.8 sends 22 bytes, not sizeof(FILE_STANDARD_INFORMATION).
         case RDPDriveFsInformationClass.fileAttributeTagInformation:
             buffer.appendLittleEndianUInt32(fileAttributes(file.url, isDirectory: file.isDirectory))
             buffer.appendLittleEndianUInt32(0)                     // ReparseTag
@@ -362,16 +428,30 @@ final class RDPDriveShare {
         case RDPDriveFsInformationClass.fileBasicInformation:
             break   // times/attributes: accept but don't apply
         default:
-            return (RDPDriveStatus.notSupported, lengthPrefixed(Data()))
+            return (RDPDriveStatus.notSupported, echoedLength(length))
         }
-        return (RDPDriveStatus.success, lengthPrefixed(Data()))
+        return (RDPDriveStatus.success, echoedLength(length))
+    }
+
+    /// DR_DRIVE_SET_INFORMATION_RSP carries the *request's* Length, not the response body's
+    /// (MS-RDPEFS 2.2.3.4.9: "MUST be equal to the Length field in the Server Drive Set Information
+    /// Request"). Answering 0 makes Windows treat the set as having done nothing, so renaming a
+    /// newly created file or folder silently fails.
+    private func echoedLength(_ length: UInt32) -> Data {
+        var data = Data()
+        data.appendLittleEndianUInt32(length)
+        return data
     }
 
     private func rename(file: OpenFile, fileID: UInt32, request: Data) -> Bool {
         var cursor = ByteCursor(request)
-        // FILE_RENAME_INFORMATION: ReplaceIfExists(1), RootDirectory(8), FileNameLength(4), FileName[]
+        // RDP_FILE_RENAME_INFORMATION (MS-RDPEFS 2.2.3.3.9): ReplaceIfExists(1), RootDirectory(1),
+        // FileNameLength(4), FileName[]. RootDirectory is ONE byte here - the NT
+        // FILE_RENAME_INFORMATION's 8-byte HANDLE is not what goes on the wire. Skipping 8 reads
+        // FileNameLength from the wrong offset, so every rename fails; Explorer creates a folder as
+        // "New folder" and then renames it, which made creating one look impossible.
         guard let replace = try? cursor.readUInt8(),
-              let _ = try? cursor.readData(count: 8),
+              let _ = try? cursor.readUInt8(),
               let nameLength = try? cursor.readLittleEndianUInt32(),
               let nameData = try? cursor.readData(count: Int(nameLength)),
               let target = resolve(decodeUTF16(nameData)) else { return false }
@@ -448,35 +528,101 @@ final class RDPDriveShare {
               let pathData = try? body.readData(count: Int(pathLength)),
               var file = openFiles[fileID], file.isDirectory
         else { return failure() }
-        _ = pathData   // wildcard pattern; we return all entries
+        // The search pattern selects which names this enumeration returns. Discarding it is not a
+        // harmless simplification: Windows serves a by-name attribute lookup by enumerating the
+        // parent with the file's own name as the pattern, so answering with the whole listing hands
+        // it entry zero - "." - and it concludes the file is a directory of zero bytes. That is what
+        // put a folder property sheet on a .docx. The wildcard case hid it, since returning
+        // everything for "*" is the right answer.
+        // The Path is share-root-relative and may carry a directory prefix; the handle already
+        // identifies the directory, so only the last component is the pattern. It is NOT routed
+        // through resolve(), which rejects a component equal to "." - a legal single-name pattern.
+        let requestedPath = decodeUTF16(pathData)
+        let pattern = requestedPath.split(separator: "\\").last.map(String.init) ?? ""
 
         if initialQuery != 0 || file.enumeration == nil {
             let children = (try? fileManager.contentsOfDirectory(
                 at: file.url, includingPropertiesForKeys: nil, options: []
             )) ?? []
-            file.enumeration = children.sorted { $0.lastPathComponent < $1.lastPathComponent }
+            // `.` and `..` must lead the enumeration. `contentsOfDirectory` omits them, but every
+            // filesystem Windows knows reports them, and its redirector needs them to establish the
+            // directory node: hand it a listing that starts at the first real file and Explorer
+            // abandons the enumeration and tears the redirection down. `..` on the share root is
+            // clamped to the root itself rather than escaping the share.
+            let parent = file.url.path == rootURL.path
+                ? file.url
+                : file.url.deletingLastPathComponent()
+            let candidates = [
+                DirectoryListingEntry(name: ".", url: file.url),
+                DirectoryListingEntry(name: "..", url: parent),
+            ] + children
+                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+                .map { DirectoryListingEntry(name: $0.lastPathComponent, url: $0) }
+            // Filtering the whole candidate list, "." and ".." included, needs no special cases:
+            // "*" keeps them, a literal name drops them.
+            file.enumeration = candidates.filter { matchesSearchPattern($0.name, pattern: pattern) }
             file.enumIndex = 0
         }
         guard let entries = file.enumeration, file.enumIndex < entries.count else {
             openFiles[fileID] = file
-            return (RDPDriveStatus.noMoreFiles, lengthPrefixed(Data()))
+            // MS-RDPEFS 2.2.3.4.10: a first query that matches nothing is STATUS_NO_SUCH_FILE;
+            // running off the end of a continuation is STATUS_NO_MORE_FILES.
+            let status = initialQuery != 0 && (file.enumeration?.isEmpty ?? true)
+                ? RDPDriveStatus.noSuchFile
+                : RDPDriveStatus.noMoreFiles
+            return (status, lengthPrefixed(Data()) + Data(count: 1))
         }
 
         // One entry per response keeps the encoding simple and avoids NextEntryOffset alignment bugs.
-        let url = entries[file.enumIndex]
+        let listed = entries[file.enumIndex]
         file.enumIndex += 1
         openFiles[fileID] = file
-        let entry = directoryEntry(for: url, infoClass: infoClass)
+        let entry = directoryEntry(name: listed.name, url: listed.url, infoClass: infoClass)
         return (RDPDriveStatus.success, lengthPrefixed(entry))
     }
 
-    private func directoryEntry(for url: URL, infoClass: UInt32) -> Data {
+    /// Match one name against a Windows directory search pattern (`*` and `?`).
+    ///
+    /// Comparison is case-insensitive and canonically precomposed: macOS stores decomposed Unicode,
+    /// so a literal pattern for an accented name would otherwise never match its own file.
+    private func matchesSearchPattern(_ name: String, pattern: String) -> Bool {
+        // "*.*" is the DOS spelling of "everything", including names with no dot at all.
+        if pattern.isEmpty || pattern == "*" || pattern == "*.*" { return true }
+        let subject = Array(name.precomposedStringWithCanonicalMapping.lowercased())
+        let glob = Array(pattern.precomposedStringWithCanonicalMapping.lowercased())
+
+        var subjectIndex = 0, globIndex = 0
+        var starIndex = -1, resumeIndex = 0
+        while subjectIndex < subject.count {
+            if globIndex < glob.count,
+               glob[globIndex] == "?" || glob[globIndex] == subject[subjectIndex] {
+                subjectIndex += 1
+                globIndex += 1
+            } else if globIndex < glob.count, glob[globIndex] == "*" {
+                starIndex = globIndex
+                globIndex += 1
+                resumeIndex = subjectIndex
+            } else if starIndex >= 0 {
+                globIndex = starIndex + 1
+                resumeIndex += 1
+                subjectIndex = resumeIndex
+            } else {
+                return false
+            }
+        }
+        while globIndex < glob.count, glob[globIndex] == "*" { globIndex += 1 }
+        return globIndex == glob.count
+    }
+
+    private func directoryEntry(name reportedName: String, url: URL, infoClass: UInt32) -> Data {
         let attributes = try? fileManager.attributesOfItem(atPath: url.path)
         let isDir = (attributes?[.type] as? FileAttributeType) == .typeDirectory
         let size = (attributes?[.size] as? UInt64) ?? 0
         let created = attributes?[.creationDate] as? Date
         let modified = attributes?[.modificationDate] as? Date
-        let name = utf16LE(url.lastPathComponent)   // no null terminator in directory entries
+        let name = utf16LE(reportedName)   // no null terminator in directory entries
+        // Attributes come from the target, not the reported name: `.` and `..` are ordinary
+        // directories and must not pick up the hidden bit their leading dot would imply.
         let attrs = fileAttributes(url, isDirectory: isDir)
 
         var data = Data()
@@ -491,8 +637,9 @@ final class RDPDriveShare {
         data.appendLittleEndianUInt64(fileTime(modified))
         data.appendLittleEndianUInt64(fileTime(modified))
         data.appendLittleEndianUInt64(fileTime(modified))
-        data.appendLittleEndianUInt64(size)                       // EndOfFile
-        data.appendLittleEndianUInt64(size)                       // AllocationSize
+        let reportedSize = isDir ? 0 : size
+        data.appendLittleEndianUInt64(reportedSize)               // EndOfFile
+        data.appendLittleEndianUInt64(reportedSize)               // AllocationSize
         data.appendLittleEndianUInt32(attrs)
         data.appendLittleEndianUInt32(UInt32(name.count))         // FileNameLength
         if infoClass == RDPDriveFsInformationClass.fileFullDirectoryInformation
@@ -501,7 +648,11 @@ final class RDPDriveShare {
         }
         if infoClass == RDPDriveFsInformationClass.fileBothDirectoryInformation {
             data.appendUInt8(0)                                   // ShortNameLength
-            data.appendUInt8(0)                                   // Reserved
+            // No Reserved byte here. MS-FSCC's FILE_BOTH_DIR_INFORMATION has one after
+            // ShortNameLength, but MS-RDPEFS 2.2.3.4.10 puts 93 bytes on the wire, not the struct's
+            // 94: sending it shifts ShortName and FileName one byte late, Windows reads a garbage
+            // name, and Explorer abandons the enumeration. FreeRDP marks the same spot
+            // "Reserved(1), MUST NOT be added!".
             data.append(Data(count: 24))                          // ShortName[12] UTF-16
         }
         data.append(name)
