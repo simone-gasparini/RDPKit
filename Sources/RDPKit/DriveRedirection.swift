@@ -131,6 +131,9 @@ final class RDPDriveShare {
         var isDirectory: Bool
         var deleteOnClose: Bool
         var handle: FileHandle?
+        /// Whether `handle` was opened for writing. A read-only handle answers a WRITE with
+        /// STATUS_ACCESS_DENIED instead of raising.
+        var isWritable: Bool
         var enumeration: [DirectoryListingEntry]?   // directory listing, built on the initial query
         var enumIndex: Int
     }
@@ -238,7 +241,7 @@ final class RDPDriveShare {
             let options = try? body.readLittleEndianUInt32(),
             let pathLength = try? body.readLittleEndianUInt32(),
             let pathData = try? body.readData(count: Int(pathLength))
-        else { return failure() }
+        else { return (RDPDriveStatus.unsuccessful, createBody(fileID: 0, information: 0)) }
 
         let remotePath = decodeUTF16(pathData)
         guard let url = resolve(remotePath) else {
@@ -269,11 +272,11 @@ final class RDPDriveShare {
             guard existed else { return (RDPDriveStatus.objectNameNotFound, createBody(fileID: 0, information: 0)) }
         case RDPDriveCreateDisposition.create:
             guard existed == false else { return (RDPDriveStatus.objectNameCollision, createBody(fileID: 0, information: 0)) }
-            guard makeItem(at: url, directory: wantsDirectory) else { return failure() }
+            guard makeItem(at: url, directory: wantsDirectory) else { return (RDPDriveStatus.unsuccessful, createBody(fileID: 0, information: 0)) }
             isDir = wantsDirectory
         case RDPDriveCreateDisposition.openIf:
             if existed == false {
-                guard makeItem(at: url, directory: wantsDirectory) else { return failure() }
+                guard makeItem(at: url, directory: wantsDirectory) else { return (RDPDriveStatus.unsuccessful, createBody(fileID: 0, information: 0)) }
                 isDir = wantsDirectory
             }
         case RDPDriveCreateDisposition.overwrite:
@@ -282,19 +285,25 @@ final class RDPDriveShare {
         case RDPDriveCreateDisposition.overwriteIf, RDPDriveCreateDisposition.supersede:
             if isDir == false { fileManager.createFile(atPath: url.path, contents: Data()) }
         default:
-            return failure()
+            return (RDPDriveStatus.unsuccessful, createBody(fileID: 0, information: 0))
         }
 
         var handle: FileHandle?
+        var writable = false
         if isDir == false {
             handle = try? FileHandle(forUpdating: url)
-            if handle == nil { handle = try? FileHandle(forReadingFrom: url) }   // read-only files
+            writable = handle != nil
+            // A read-only file still opens, so it can be read - but the handle is remembered as
+            // read-only, and a WRITE against it is refused rather than attempted. Attempting it
+            // raises an Objective-C exception from the legacy FileHandle API, which no Swift `catch`
+            // can intercept: the process aborts, so a remote server could kill the app outright.
+            if handle == nil { handle = try? FileHandle(forReadingFrom: url) }
         }
         let fileID = allocateFileID()
         openFiles[fileID] = OpenFile(
             url: url, isDirectory: isDir,
             deleteOnClose: options & RDPDriveCreateOptions.deleteOnClose != 0,
-            handle: handle, enumeration: nil, enumIndex: 0
+            handle: handle, isWritable: writable, enumeration: nil, enumIndex: 0
         )
         let information: UInt8 = existed ? RDPDriveCreateInformation.opened : RDPDriveCreateInformation.created
         return (RDPDriveStatus.success, createBody(fileID: fileID, information: information))
@@ -312,9 +321,37 @@ final class RDPDriveShare {
     private func close(_ fileID: UInt32) -> (UInt32, Data) {
         if let file = openFiles.removeValue(forKey: fileID) {
             try? file.handle?.close()
-            if file.deleteOnClose { try? fileManager.removeItem(at: file.url) }
+            if file.deleteOnClose { deleteOnClose(file) }
         }
         return (RDPDriveStatus.success, Data(count: 5))   // Padding (5 bytes)
+    }
+
+    /// Delete an item whose handle carried FILE_DELETE_ON_CLOSE, with rmdir(2) semantics.
+    ///
+    /// `removeItem` is recursive, which is not what a delete-on-close means: a directory is deleted
+    /// only if it is empty, and the share root is never deleted at all. Without both guards a single
+    /// CREATE with an empty path and the delete-on-close flag destroys the whole shared folder.
+    private func deleteOnClose(_ file: OpenFile) {
+        guard file.url.path != rootURL.path else { return }
+        if file.isDirectory, directoryIsEmpty(file.url) == false { return }
+        try? fileManager.removeItem(at: file.url)
+    }
+
+    /// Whether two paths name the same item. Path text is not enough: macOS volumes are usually
+    /// case-insensitive, so "a.txt" and "A.txt" are one file with two spellings.
+    private func sameFile(_ lhs: URL, _ rhs: URL) -> Bool {
+        let key = URLResourceKey.fileResourceIdentifierKey
+        guard let left = try? lhs.resourceValues(forKeys: [key]).fileResourceIdentifier,
+              let right = try? rhs.resourceValues(forKeys: [key]).fileResourceIdentifier
+        else { return lhs.standardizedFileURL == rhs.standardizedFileURL }
+        return left.isEqual(right)
+    }
+
+    private func directoryIsEmpty(_ url: URL) -> Bool {
+        let children = try? fileManager.contentsOfDirectory(
+            at: url, includingPropertiesForKeys: nil, options: []
+        )
+        return (children ?? []).isEmpty
     }
 
     // MARK: - READ / WRITE
@@ -328,22 +365,22 @@ final class RDPDriveShare {
     /// answering with fewer bytes than were asked for is legal: the reply carries its own Length and
     /// the server simply issues another read. 8 MiB leaves two orders of magnitude of headroom over
     /// anything observed while keeping a single request bounded.
-    private static let maximumReadByteCount = 8 * 1_024 * 1_024
+    static let maximumReadByteCount = 8 * 1_024 * 1_024
 
     private func read(_ fileID: UInt32, _ body: inout ByteCursor) -> (UInt32, Data) {
         guard let length = try? body.readLittleEndianUInt32(),
               let offset = try? body.readLittleEndianUInt64(),
               let file = openFiles[fileID], let handle = file.handle
-        else { return failure() }
+        else { return (RDPDriveStatus.unsuccessful, lengthPrefixed(Data())) }
         do {
             try handle.seek(toOffset: offset)
-            let data = handle.readData(ofLength: min(Int(length), Self.maximumReadByteCount))
+            let data = try handle.read(upToCount: min(Int(length), Self.maximumReadByteCount)) ?? Data()
             var payload = Data()
             payload.appendLittleEndianUInt32(UInt32(data.count))
             payload.append(data)
             return (RDPDriveStatus.success, payload)
         } catch {
-            return failure()
+            return (RDPDriveStatus.unsuccessful, lengthPrefixed(Data()))
         }
     }
 
@@ -353,24 +390,40 @@ final class RDPDriveShare {
               let _ = try? body.readData(count: 20),                 // Padding
               let data = try? body.readData(count: Int(length)),
               let file = openFiles[fileID], let handle = file.handle
-        else { return failure() }
+        else { return writeFailure() }
+        // Refuse rather than attempt: writing through a read-only handle raises an Objective-C
+        // exception that no Swift `catch` can intercept, and the process aborts.
+        guard file.isWritable else {
+            return (RDPDriveStatus.accessDenied, writeBody(written: 0))
+        }
         do {
             try handle.seek(toOffset: offset)
-            handle.write(data)
-            var payload = Data()
-            payload.appendLittleEndianUInt32(UInt32(data.count))
-            payload.appendUInt8(0)                                   // Padding
-            return (RDPDriveStatus.success, payload)
+            try handle.write(contentsOf: data)
+            return (RDPDriveStatus.success, writeBody(written: data.count))
         } catch {
-            return failure()
+            return writeFailure()
         }
+    }
+
+    /// DR_DRIVE_WRITE_RSP: Length plus one padding byte, required on every reply including a
+    /// failure - a body-less completion leaves the server parsing Length off the end of the PDU.
+    private func writeBody(written: Int) -> Data {
+        var payload = Data()
+        payload.appendLittleEndianUInt32(UInt32(written))
+        payload.appendUInt8(0)
+        return payload
+    }
+
+    private func writeFailure() -> (UInt32, Data) {
+        (RDPDriveStatus.unsuccessful, writeBody(written: 0))
     }
 
     // MARK: - QUERY / SET INFORMATION
 
     private func queryInformation(_ fileID: UInt32, _ body: inout ByteCursor) -> (UInt32, Data) {
         guard let infoClass = try? body.readLittleEndianUInt32(),
-              let file = openFiles[fileID] else { return failure() }
+              let file = openFiles[fileID]
+        else { return (RDPDriveStatus.unsuccessful, lengthPrefixed(Data())) }
         let attributes = try? fileManager.attributesOfItem(atPath: file.url.path)
         let size = (attributes?[.size] as? UInt64) ?? 0
         let created = attributes?[.creationDate] as? Date
@@ -411,12 +464,24 @@ final class RDPDriveShare {
               let length = try? body.readLittleEndianUInt32(),
               let _ = try? body.readData(count: 24),                 // Padding
               let payload = try? body.readData(count: Int(length)),
-              let file = openFiles[fileID] else { return failure() }
+              let file = openFiles[fileID] else { return (RDPDriveStatus.unsuccessful, Data()) }
 
         switch infoClass {
         case RDPDriveFsInformationClass.fileDispositionInformation:
             // Any non-empty request marks delete-on-close (DeletePending flag).
-            openFiles[fileID]?.deleteOnClose = payload.first.map { $0 != 0 } ?? true
+            let pending = payload.first.map { $0 != 0 } ?? true
+            if pending {
+                // NTFS refuses here rather than at close, and so must this: RemoveDirectory over a
+                // redirected drive is a disposition set, and answering success for a directory with
+                // contents is what turns `rmdir` into a recursive delete of the user's files.
+                if file.url.path == rootURL.path {
+                    return (RDPDriveStatus.accessDenied, echoedLength(length))
+                }
+                if file.isDirectory, directoryIsEmpty(file.url) == false {
+                    return (RDPDriveStatus.directoryNotEmpty, echoedLength(length))
+                }
+            }
+            openFiles[fileID]?.deleteOnClose = pending
         case RDPDriveFsInformationClass.fileEndOfFileInformation,
              RDPDriveFsInformationClass.fileAllocationInformation:
             var cursor = ByteCursor(payload)
@@ -424,7 +489,7 @@ final class RDPDriveShare {
                 try? file.handle?.truncate(atOffset: newSize)
             }
         case RDPDriveFsInformationClass.fileRenameInformation:
-            guard rename(file: file, fileID: fileID, request: payload) else { return failure() }
+            guard rename(file: file, fileID: fileID, request: payload) else { return (RDPDriveStatus.unsuccessful, echoedLength(length)) }
         case RDPDriveFsInformationClass.fileBasicInformation:
             break   // times/attributes: accept but don't apply
         default:
@@ -455,9 +520,26 @@ final class RDPDriveShare {
               let nameLength = try? cursor.readLittleEndianUInt32(),
               let nameData = try? cursor.readData(count: Int(nameLength)),
               let target = resolve(decodeUTF16(nameData)) else { return false }
-        if fileManager.fileExists(atPath: target.path) {
+        // A case-only rename on a case-insensitive volume names the SAME file, so `fileExists` is
+        // true and removing "the existing target" unlinks the very file about to be moved. Compare
+        // identity, not path text, and move straight through when they are the same item.
+        let isSameItem = fileManager.fileExists(atPath: target.path) && sameFile(file.url, target)
+        if fileManager.fileExists(atPath: target.path), isSameItem == false {
             guard replace != 0 else { return false }
-            try? fileManager.removeItem(at: target)
+            // Move the existing target aside rather than deleting it: if the rename then fails, the
+            // destination still exists. Deleting first makes every failure destructive.
+            let backup = target.appendingPathExtension("rdpkit-replacing")
+            try? fileManager.removeItem(at: backup)
+            guard (try? fileManager.moveItem(at: target, to: backup)) != nil else { return false }
+            do {
+                try fileManager.moveItem(at: file.url, to: target)
+                try? fileManager.removeItem(at: backup)
+                openFiles[fileID]?.url = target
+                return true
+            } catch {
+                try? fileManager.moveItem(at: backup, to: target)   // put it back
+                return false
+            }
         }
         do {
             try fileManager.moveItem(at: file.url, to: target)
@@ -471,7 +553,9 @@ final class RDPDriveShare {
     // MARK: - QUERY VOLUME INFORMATION
 
     private func queryVolume(_ body: inout ByteCursor) -> (UInt32, Data) {
-        guard let infoClass = try? body.readLittleEndianUInt32() else { return failure() }
+        guard let infoClass = try? body.readLittleEndianUInt32() else {
+            return (RDPDriveStatus.unsuccessful, lengthPrefixed(Data()))
+        }
         var buffer = Data()
         switch infoClass {
         case RDPDriveFsVolumeClass.volumeInformation:
@@ -527,7 +611,7 @@ final class RDPDriveShare {
               let _ = try? body.readData(count: 23),                 // Padding
               let pathData = try? body.readData(count: Int(pathLength)),
               var file = openFiles[fileID], file.isDirectory
-        else { return failure() }
+        else { return (RDPDriveStatus.unsuccessful, lengthPrefixed(Data()) + Data(count: 1)) }
         // The search pattern selects which names this enumeration returns. Discarding it is not a
         // harmless simplification: Windows serves a by-name attribute lookup by enumerating the
         // parent with the file's own name as the pattern, so answering with the whole listing hands
@@ -687,8 +771,6 @@ final class RDPDriveShare {
         if isDirectory == false, attrs == 0 { attrs = RDPDriveFileAttribute.archive }
         return attrs
     }
-
-    private func failure() -> (UInt32, Data) { (RDPDriveStatus.unsuccessful, Data()) }
 
     private func lengthPrefixed(_ buffer: Data) -> Data {
         var data = Data()

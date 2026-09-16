@@ -225,8 +225,19 @@ struct RDPStaticVirtualChannelPDU: Equatable, Sendable {
 }
 
 struct RDPStaticVirtualChannelReassembler: Sendable {
+    /// Largest message that may be reassembled. Far above anything rdpdr, cliprdr or rdpsnd
+    /// legitimately sends, and low enough that a hostile server cannot exhaust memory.
+    static let maximumMessageByteCount: UInt32 = 8 * 1_024 * 1_024
+
     private var totalLength: UInt32?
     private var payload = Data()
+
+    /// Drop any half-assembled message. Called when a fragment is rejected, so one bad PDU cannot
+    /// wedge the channel by leaving a message that can never complete.
+    mutating func reset() {
+        totalLength = nil
+        payload = Data()
+    }
 
     mutating func append(
         _ pdu: RDPStaticVirtualChannelPDU,
@@ -265,6 +276,13 @@ struct RDPStaticVirtualChannelReassembler: Sendable {
         }
 
         if hasFirst {
+            // Reject an absurd announced length BEFORE any of it is resident. `totalLength` is
+            // chosen entirely by the server, and the accumulated buffer was bounded only against
+            // that same number - so a first fragment claiming 4 GiB, followed by chunks that never
+            // set LAST, grows until the client is killed.
+            guard pdu.totalLength <= Self.maximumMessageByteCount else {
+                throw RDPDecodeError.invalidStaticVirtualChannelPDU
+            }
             guard totalLength == nil, pdu.totalLength >= UInt32(pdu.payload.count) else {
                 throw RDPDecodeError.invalidStaticVirtualChannelPDU
             }
@@ -319,8 +337,13 @@ final class RDPStaticVirtualChannelInbound: @unchecked Sendable {
     ) throws -> RDPStaticVirtualChannelPDU? {
         lock.lock()
         defer { lock.unlock() }
-        return try reassembler.append(
-            pdu, maximumChunkByteCount: maximumChunkByteCount, requiresShowProtocol: false
-        )
+        do {
+            return try reassembler.append(
+                pdu, maximumChunkByteCount: maximumChunkByteCount, requiresShowProtocol: false
+            )
+        } catch {
+            reassembler.reset()   // never stay wedged on a message that can no longer complete
+            throw error
+        }
     }
 }

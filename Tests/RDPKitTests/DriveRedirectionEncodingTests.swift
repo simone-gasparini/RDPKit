@@ -28,6 +28,23 @@ struct DriveRedirectionEncodingTests {
         return share.handle(io, body: &cursor)
     }
 
+    /// Open an existing file by name and return its FileId.
+    private func openExisting(_ share: RDPDriveShare, name: String) throws -> UInt32 {
+        var body = Data()
+        body.appendLittleEndianUInt32(0x0000_0080)
+        body.appendLittleEndianUInt64(0)
+        body.appendLittleEndianUInt32(0)
+        body.appendLittleEndianUInt32(7)
+        body.appendLittleEndianUInt32(1)                      // FILE_OPEN
+        body.appendLittleEndianUInt32(0x0000_0040)            // FILE_NON_DIRECTORY_FILE
+        let path = Array(name.utf16).flatMap { [UInt8($0 & 0xff), UInt8($0 >> 8)] }
+        body.appendLittleEndianUInt32(UInt32(path.count))
+        body.append(contentsOf: path)
+        let created = try #require(request(major: 0x0000_0000, body: body, on: share))
+        var cursor = ByteCursor(created.payload)
+        return try cursor.readLittleEndianUInt32()
+    }
+
     private func createRoot(_ share: RDPDriveShare, options: UInt32 = 0x0000_0001) throws -> UInt32 {
         var body = Data()
         body.appendLittleEndianUInt32(0x0000_0080)   // DesiredAccess
@@ -355,6 +372,131 @@ struct DriveRedirectionEncodingTests {
         let returned = try cursor.readLittleEndianUInt32()
         #expect(returned == 4_096, "a short read is legal; the reply carries its own Length")
         #expect(reply.payload.count == 4 + 4_096)
+    }
+
+    /// The previous test cannot fail if the clamp is deleted: a 4 KiB file returns 4 KiB either way.
+    /// This one needs a file LARGER than the cap, so the clamp is the only thing bounding the reply.
+    @Test func aReadLargerThanTheCapIsTruncatedToIt() throws {
+        let (share, root) = try makeShare()
+        let cap = RDPDriveShare.maximumReadByteCount
+        let big = root.appendingPathComponent("huge.bin")
+        try Data(repeating: 0x7a, count: cap + 4_096).write(to: big)
+
+        var createBody = Data()
+        createBody.appendLittleEndianUInt32(0x0000_0080)
+        createBody.appendLittleEndianUInt64(0)
+        createBody.appendLittleEndianUInt32(0)
+        createBody.appendLittleEndianUInt32(7)
+        createBody.appendLittleEndianUInt32(1)
+        createBody.appendLittleEndianUInt32(0x0000_0040)
+        let path = Array("\\huge.bin".utf16).flatMap { [UInt8($0 & 0xff), UInt8($0 >> 8)] }
+        createBody.appendLittleEndianUInt32(UInt32(path.count))
+        createBody.append(contentsOf: path)
+        let created = try #require(request(major: 0x0000_0000, body: createBody, on: share))
+        var idCursor = ByteCursor(created.payload)
+        let fileID = try idCursor.readLittleEndianUInt32()
+
+        var readBody = Data()
+        readBody.appendLittleEndianUInt32(UInt32.max)
+        readBody.appendLittleEndianUInt64(0)
+        readBody.append(Data(count: 20))
+        let reply = try #require(request(major: 0x0000_0003, fileID: fileID, body: readBody, on: share))
+        var cursor = ByteCursor(reply.payload)
+        #expect(try cursor.readLittleEndianUInt32() == UInt32(cap),
+                "a remote-chosen Length must not size the allocation")
+        try? FileManager.default.removeItem(at: big)
+    }
+
+    /// A delete-on-close on a directory with contents must be refused at the disposition set, as
+    /// NTFS does - not honoured at close, where `removeItem` would take the whole tree with it.
+    @Test func deleteOnCloseRefusesANonEmptyDirectoryAndTheShareRoot() throws {
+        let (share, root) = try makeShare()
+        let sub = root.appendingPathComponent("keep", isDirectory: true)
+        try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
+        try Data("precious".utf8).write(to: sub.appendingPathComponent("file.txt"))
+
+        func setDisposition(fileID: UInt32) throws -> UInt32 {
+            var body = Data()
+            body.appendLittleEndianUInt32(13)                 // FileDispositionInformation
+            body.appendLittleEndianUInt32(1)                  // Length
+            body.append(Data(count: 24))                      // Padding
+            body.appendUInt8(1)                               // DeletePending
+            return try #require(request(major: 0x0000_0006, fileID: fileID, body: body, on: share)).status
+        }
+
+        // A directory with contents.
+        var createBody = Data()
+        createBody.appendLittleEndianUInt32(0x0000_0080)
+        createBody.appendLittleEndianUInt64(0)
+        createBody.appendLittleEndianUInt32(0)
+        createBody.appendLittleEndianUInt32(7)
+        createBody.appendLittleEndianUInt32(1)
+        createBody.appendLittleEndianUInt32(0x0000_0001)      // FILE_DIRECTORY_FILE
+        let path = Array("\\keep".utf16).flatMap { [UInt8($0 & 0xff), UInt8($0 >> 8)] }
+        createBody.appendLittleEndianUInt32(UInt32(path.count))
+        createBody.append(contentsOf: path)
+        let created = try #require(request(major: 0x0000_0000, body: createBody, on: share))
+        var idCursor = ByteCursor(created.payload)
+        let dirID = try idCursor.readLittleEndianUInt32()
+        #expect(try setDisposition(fileID: dirID) == 0xC000_0101, "STATUS_DIRECTORY_NOT_EMPTY")
+
+        // And the share root itself, whatever it contains.
+        let rootID = try createRoot(share)
+        #expect(try setDisposition(fileID: rootID) == 0xC000_0022, "the share root is never deletable")
+
+        // Close both; nothing may have been removed.
+        for id in [dirID, rootID] {
+            _ = request(major: 0x0000_0002, fileID: id, body: Data(count: 32), on: share)
+        }
+        #expect(FileManager.default.fileExists(atPath: sub.appendingPathComponent("file.txt").path))
+        #expect(FileManager.default.fileExists(atPath: root.path))
+    }
+
+    /// macOS volumes are case-insensitive, so "a.txt" and "A.txt" are one file. Removing "the
+    /// existing target" first unlinks the very file about to be moved.
+    @Test func aCaseOnlyRenameKeepsTheFile() throws {
+        let (share, root) = try makeShare()
+        let fileID = try openExisting(share, name: "\\a.txt")
+
+        let newName = Array("\\A.TXT".utf16).flatMap { [UInt8($0 & 0xff), UInt8($0 >> 8)] }
+        var info = Data()
+        info.appendUInt8(1)                                   // ReplaceIfExists
+        info.appendUInt8(0)                                   // RootDirectory
+        info.appendLittleEndianUInt32(UInt32(newName.count))
+        info.append(contentsOf: newName)
+        var body = Data()
+        body.appendLittleEndianUInt32(10)                     // FileRenameInformation
+        body.appendLittleEndianUInt32(UInt32(info.count))
+        body.append(Data(count: 24))
+        body.append(info)
+        let reply = try #require(request(major: 0x0000_0006, fileID: fileID, body: body, on: share))
+
+        #expect(reply.status == 0)
+        let contents = try FileManager.default.contentsOfDirectory(atPath: root.path)
+        #expect(contents.contains { $0.lowercased() == "a.txt" }, "the file must still exist")
+    }
+
+    /// Writing through a read-only handle must be refused, not attempted: the legacy FileHandle
+    /// write raises an Objective-C exception that no Swift catch can intercept, aborting the process.
+    @Test func aWriteToAReadOnlyFileIsRefusedRatherThanAttempted() throws {
+        let (share, root) = try makeShare()
+        let locked = root.appendingPathComponent("locked.txt")
+        try Data("read only".utf8).write(to: locked)
+        try FileManager.default.setAttributes([.posixPermissions: 0o444], ofItemAtPath: locked.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: locked.path) }
+
+        let fileID = try openExisting(share, name: "\\locked.txt")
+        var body = Data()
+        body.appendLittleEndianUInt32(4)                      // Length
+        body.appendLittleEndianUInt64(0)                      // Offset
+        body.append(Data(count: 20))                          // Padding
+        body.append(Data("boom".utf8))
+        let reply = try #require(request(major: 0x0000_0004, fileID: fileID, body: body, on: share))
+
+        #expect(reply.status == 0xC000_0022, "STATUS_ACCESS_DENIED")
+        // Every DR_DRIVE_WRITE_RSP carries Length + padding, failure included.
+        #expect(reply.payload.count == 5)
+        #expect(try String(contentsOf: locked, encoding: .utf8) == "read only")
     }
 
     /// A change-notification IRP stays outstanding; answering it retires the directory handle and
